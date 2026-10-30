@@ -6,6 +6,7 @@ Code Explanation Bot
 1. Explain code (language is detected automatically)
 2. Explain code (I will choose the language)
 3. Show examples
+4. Chat with AI
 0. Exit
 """
 
@@ -199,6 +200,53 @@ def describe_brace_line(line: str) -> str:
     if "{" in line:
         return "Starts a block of code."
     return "Ends a block of code."
+
+
+# ---------------------------------------------------------------------------
+# Lines that are only a value (for example 1234 or "hello")
+# ---------------------------------------------------------------------------
+
+NUMBER_RE = re.compile(
+    r"^[+-]?(?:0[xX][0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)[uUlLfF]*$"
+)
+STRING_RE = re.compile(r"""^(?:"[^"]*"|'[^']*')$""")
+
+VALUE_EXAMPLES = {
+    "python": "age = {v}",
+    "java": "int age = {v};",
+    "c": "int age = {v};",
+    "sql": "SELECT {v};",
+}
+
+
+def is_literal(raw: str) -> bool:
+    return bool(NUMBER_RE.match(raw) or STRING_RE.match(raw))
+
+
+def describe_literal(raw: str, language: str):
+    """Explain a line that is only a number or a string. Returns None otherwise."""
+    if NUMBER_RE.match(raw):
+        kind = "number"
+    elif STRING_RE.match(raw):
+        kind = "piece of text"
+    else:
+        return None
+    example = VALUE_EXAMPLES.get(language, "x = {v}").format(v=raw)
+    return (
+        f"This is just a {kind} ({raw}), not an instruction. On its own it does "
+        f"nothing. Store it in a variable or use it in a statement, for example: {example}"
+    )
+
+
+def bracket_change(line: str, language: str) -> int:
+    """How many brackets a line opens minus how many it closes (quotes ignored).
+
+    Used to tell a stray value like "42" from an item inside a multi-line list,
+    where a bare number is perfectly normal.
+    """
+    line = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', "", line)
+    opens, closes = ("([{", ")]}") if language == "python" else ("([", ")]")
+    return sum(line.count(c) for c in opens) - sum(line.count(c) for c in closes)
 
 
 # ---------------------------------------------------------------------------
@@ -558,10 +606,14 @@ EXPLAINERS = {
 }
 
 
-def explain_line(line: str, language: str) -> str:
+def explain_line(line: str, language: str, check_literal: bool = True) -> str:
     line = strip_inline_comment(line, language).strip()
     if not line:
         return ""
+    if check_literal:
+        literal = describe_literal(simplify_line(line), language)
+        if literal:
+            return literal
     explainer = EXPLAINERS.get(language)
     if explainer:
         return explainer(line)
@@ -572,6 +624,7 @@ def explain_code_lines(snippet: str, language: str) -> list:
     """Return a list of (code_line, explanation) pairs, one per explained line."""
     explanations = []
     in_block_comment = False
+    depth = 0  # how many ( [ { are still open from earlier lines
 
     for raw_line in snippet.splitlines():
         cleaned = raw_line.strip()
@@ -590,6 +643,10 @@ def explain_code_lines(snippet: str, language: str) -> list:
         if not cleaned:  # blank line or comment-only line
             continue
 
+        # A bare value inside an open bracket is a list item, not a stray value.
+        inside_brackets = depth > 0
+        depth = max(0, depth + bracket_change(cleaned, language))
+
         body = cleaned
         if language in BRACE_LANGUAGES:
             body = strip_block_braces(cleaned)
@@ -597,11 +654,17 @@ def explain_code_lines(snippet: str, language: str) -> list:
                 explanations.append((cleaned, describe_brace_line(cleaned)))
                 continue
 
-        explanation = explain_line(body, language)
+        explanation = explain_line(body, language, check_literal=not inside_brackets)
         if explanation:
             explanations.append((cleaned, explanation))
 
     return explanations
+
+
+def is_only_values(snippet: str, language: str) -> bool:
+    """True when every code line is just a number or a string (comments are ignored)."""
+    pairs = explain_code_lines(snippet, language)
+    return bool(pairs) and all(is_literal(simplify_line(line)) for line, _ in pairs)
 
 
 def explain_code(snippet: str, language: str) -> str:
@@ -612,7 +675,13 @@ def explain_code(snippet: str, language: str) -> str:
     if not pairs:
         return "No valid lines were found to explain."
 
-    return "\n".join(f"{line}: {text}" for line, text in pairs)
+    result = "\n".join(f"{line}: {text}" for line, text in pairs)
+    if is_only_values(snippet, language):
+        result += (
+            "\n\nNote: this is only a value, not a full program. "
+            "Paste real code to get a fuller explanation."
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -706,8 +775,10 @@ def explain_pasted_code(language=None):
 
     if language is None:
         language = detect_language(code)
-        print(f"\nDetected language: {language.upper()}")
-        print("(Wrong guess? Use option 2 to choose the language yourself.)")
+        # A bare value like 1234 has no language, so don't claim one was detected.
+        if not is_only_values(code, language):
+            print(f"\nDetected language: {language.upper()}")
+            print("(Wrong guess? Use option 2 to choose the language yourself.)")
 
     print("\nSimple explanation:\n")
     print(explain_code(code, language))
