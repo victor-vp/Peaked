@@ -1,0 +1,746 @@
+import re
+
+
+HELP_TEXT = """
+Code Explanation Bot
+1. Explain code (language is detected automatically)
+2. Explain code (I will choose the language)
+3. Show examples
+0. Exit
+"""
+
+SUPPORTED_LANGUAGES = ("python", "java", "c", "sql")
+
+# Type this on its own line to tell the bot you have finished pasting code.
+END_MARKER = "/done"
+
+# Model used by the AI chat (option 4). Change it if your account uses another name.
+OPENAI_MODEL = "gpt-5.6-luna"
+
+
+EXAMPLE_SNIPPETS = {
+    "python": '''
+# Python example
+name = "Alice"
+print("Hello, " + name)
+if len(name) > 3:
+    print("Long name")
+''',
+    "java": '''
+public class Main {
+    public static void main(String[] args) {
+        int age = 20;
+        System.out.println("Your age is " + age);
+    }
+}
+''',
+    "c": '''
+#include <stdio.h>
+int main() {
+    int age = 20;
+    printf("Your age is %d\\n", age);
+    return 0;
+}
+''',
+    "sql": '''
+SELECT name, age
+FROM students
+WHERE age > 18
+ORDER BY name;
+'''
+}
+
+
+LINE_COMMENT_MARKERS = {"python": "#", "java": "//", "c": "//", "sql": "--"}
+BRACE_LANGUAGES = ("java", "c")
+BLOCK_COMMENT_LANGUAGES = ("java", "c", "sql")
+
+
+# ---------------------------------------------------------------------------
+# Language detection
+# ---------------------------------------------------------------------------
+
+# Statements that start a line in SQL. "from" is ignored when it is Python's
+# "from x import y".
+SQL_START_RE = re.compile(
+    r"^[ \t]*(?:select[ \t]+(?![ \t]*=)|insert\s+into\s|update\s+\w+\s*(?:set\b|$)|"
+    r"delete\s+from\s|create\s+table\s|alter\s+table\s|drop\s+table\s|"
+    r"from[ \t]+(?![ \t]*\S+[ \t]+import\b))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# For Python, Java and C every rule is (regex, points). Each rule can score up to
+# twice (so a single stray match does not decide everything) and the language
+# with the most points wins.
+PYTHON_RULES = [
+    (r"^\s*def\s+\w+\s*\(.*\)\s*(?:->\s*[^:]+)?:\s*$", 3),
+    (r"^\s*(?:if|elif|else|for|while|try|except|finally|with|class)\b[^{;]*:\s*$", 2),
+    (r"^\s*elif\b", 2),
+    (r"^\s*(?:import\s+\w[\w.]*(?:\s+as\s+\w+)?|from\s+\S+\s+import\s+.+)\s*$", 2),
+    (r"^\s*#(?!\s*(?:include|define)\b)", 1),
+    (r"\b(?:True|False|None)\b", 1),
+    (r"\bself\b", 2),
+    (r"(?<![\w.])print\s*\(", 1),
+    (r"(?<![\w.])(?:input|len|range)\s*\(", 1),
+]
+JAVA_RULES = [
+    (r"System\.out\.", 4),
+    (r"\bimport\s+java", 4),
+    (r"\bpublic\s+(?:static\s+)?(?:class|void|int|String|boolean)\b", 3),
+    (r"@Override", 3),
+    (r"\bString\b", 2),
+    (r"\bboolean\b", 2),
+    (r"\b(?:extends|implements)\b", 2),
+    (r"\b(?:ArrayList|HashMap|List|Map|Scanner)\b", 2),
+    (r"\bnew\s+\w+", 1),
+    (r"\.length\(\)", 1),
+]
+C_RULES = [
+    (r"^\s*#\s*include\s*[<\"]", 4),
+    (r"\b(?:printf|scanf|puts|getchar|fgets)\s*\(", 3),
+    (r"\bint\s+main\s*\(", 3),
+    (r"\b(?:malloc|calloc|free|sizeof)\b", 3),
+    (r"^\s*#\s*define\b", 2),
+    (r"\w->\w", 2),
+    (r"\bstruct\s+\w+", 2),
+    (r"\b(?:unsigned|size_t|typedef)\b", 2),
+    (r"\bchar\s+\*?\w+\s*\[", 2),
+]
+# Things that look the same in Java and C: type declarations, semicolons, braces.
+C_LIKE_RULES = [
+    (r"^\s*(?:int|long|short|float|double|char)\s+\*?\w+\s*(?:\[[^\]]*\])?\s*(?:=.*)?;\s*$", 2),
+    (r";\s*$", 1),
+    # A line ending in "{" opens a block, unless it is a literal like "d = {".
+    (r"^(?![^\n]*[=:]\s*\{\s*$)[^\n]*\{\s*$", 1),
+]
+DETECTION_RULES = {
+    name: [(re.compile(pattern, re.MULTILINE), points) for pattern, points in rules]
+    for name, rules in {
+        "python": PYTHON_RULES,
+        "java": JAVA_RULES,
+        "c": C_RULES,
+        "c_like": C_LIKE_RULES,
+    }.items()
+}
+
+
+def score_snippet(snippet: str, rule_set: str) -> int:
+    total = 0
+    for pattern, points in DETECTION_RULES[rule_set]:
+        total += points * min(len(pattern.findall(snippet)), 2)
+    return total
+
+
+def detect_language(snippet: str) -> str:
+    """Guess whether a snippet is Python, Java, C or SQL. Defaults to Python."""
+    if SQL_START_RE.search(snippet):
+        return "sql"
+
+    shared = score_snippet(snippet, "c_like")
+    scores = {
+        "python": score_snippet(snippet, "python"),
+        "java": score_snippet(snippet, "java") + shared,
+        "c": score_snippet(snippet, "c") + shared,
+    }
+    best = max(scores.values())
+    if best == 0:
+        return "python"
+    # On a tie, prefer Python, then C, then Java.
+    for language in ("python", "c", "java"):
+        if scores[language] == best:
+            return language
+    return "python"
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def simplify_line(line: str) -> str:
+    return line.strip().rstrip(";").strip()
+
+
+def article(phrase: str) -> str:
+    return "an" if phrase[:1].lower() in "aeiou" else "a"
+
+
+def strip_inline_comment(line: str, language: str) -> str:
+    """Remove a trailing comment, ignoring comment markers inside quotes."""
+    marker = LINE_COMMENT_MARKERS.get(language)
+    if not marker:
+        return line
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif line.startswith(marker, i):
+            return line[:i].rstrip()
+        i += 1
+    return line
+
+
+def strip_block_braces(line: str) -> str:
+    """Remove leading '}' and trailing '{' so "} else {" becomes "else"."""
+    body = line.strip().lstrip("}").strip()
+    return body.rstrip("{").strip()
+
+
+def describe_brace_line(line: str) -> str:
+    if "{" in line and "}" in line:
+        return "An empty block of code."
+    if "{" in line:
+        return "Starts a block of code."
+    return "Ends a block of code."
+
+
+# ---------------------------------------------------------------------------
+# Assignments, declarations, functions (shared by Python, Java and C)
+# ---------------------------------------------------------------------------
+
+# Matches "x = 5" as well as compound forms like "x += 1" or "x //= 2".
+# "==", "<=", ">=" and "!=" are not treated as assignments.
+ASSIGN_RE = re.compile(
+    r"^(?P<left>[^=]+?)\s*(?P<op>\*\*|//|<<|>>|[+\-*/%&|^])?=(?!=)\s*(?P<right>.+)$"
+)
+
+OP_TEMPLATES = {
+    "+": "Adds {right} to {left}.",
+    "-": "Subtracts {right} from {left}.",
+    "*": "Multiplies {left} by {right}.",
+    "/": "Divides {left} by {right}.",
+    "//": "Divides {left} by {right} and rounds down.",
+    "%": "Sets {left} to the remainder of {left} divided by {right}.",
+    "**": "Raises {left} to the power of {right}.",
+}
+
+TYPE_NAMES = "int|long|short|byte|float|double|char|boolean|String|size_t"
+
+# "int age = 20", "double *p", "char name[20]", "String[] items = ..."
+DECL_RE = re.compile(
+    r"^(?:(?:final|static|const|unsigned|signed|long|short)\s+)*"
+    rf"(?P<type>{TYPE_NAMES})\b"
+    r"(?P<arr>\s*\[\s*\])?\s*(?P<ptr>\*+)?\s*(?P<name>\w+)"
+    r"(?P<dims>(?:\s*\[[^\]]*\])*)\s*"
+    r"(?:=\s*(?P<value>.+))?$"
+)
+
+# "List<String> names" -> a declaration whose type we don't have in our list.
+TYPED_LEFT_RE = re.compile(r"^(?P<type>[\w<>\[\],.?*\s]+?)\s+(?P<name>\*?\w+)$")
+NOT_TYPES = {"return", "else", "new", "throw", "case", "goto", "delete"}
+
+INCREMENT_RE = re.compile(
+    r"^(?:(?P<pre>\+\+|--)(?P<v1>\w+)|(?P<v2>[\w.\[\]]+)(?P<post>\+\+|--))$"
+)
+
+FUNC_RE = re.compile(
+    r"^(?:(?:public|private|protected|static|final|abstract|synchronized|extern|inline)\s+)*"
+    r"(?P<ret>[\w<>\[\],.?*]+)\s+\**(?P<name>\w+)\s*\((?P<params>[^)]*)\)"
+    r"\s*(?:throws\s+[\w,.\s]+)?$"
+)
+NOT_FUNC_STARTS = {
+    "return", "else", "new", "throw", "delete", "case", "if", "while", "for", "switch", "do",
+}
+
+CALL_RE = re.compile(r"^(?P<name>[\w.]+)\s*\(.*\)$")
+
+
+def parse_assignment(raw: str):
+    """Return (left, operator, right) for an assignment line, else None."""
+    match = ASSIGN_RE.match(raw)
+    if not match:
+        return None
+    left = match.group("left").strip()
+    op = match.group("op")
+    if not left or "(" in left:  # e.g. a call like foo(a=1)
+        return None
+    if not op and left[-1] in "<>!":  # <=, >=, != comparisons
+        return None
+    return left, op, match.group("right").strip()
+
+
+def describe_assignment(left: str, op, right: str) -> str:
+    if op:
+        template = OP_TEMPLATES.get(op)
+        if template:
+            return template.format(left=left, right=right)
+        return f"Updates {left} using the {op}= operator with {right}."
+    return f"Stores the value of {right} in the variable {left}."
+
+
+def describe_declaration(match) -> str:
+    type_name = match.group("type")
+    name = match.group("name")
+    value = match.group("value")
+    if match.group("arr") or match.group("dims").strip():
+        kind = f"{type_name} array"
+    elif match.group("ptr"):
+        kind = f"{type_name} pointer"
+    else:
+        kind = f"{type_name} variable"
+    text = f"Creates {article(kind)} {kind} named {name}"
+    if value:
+        return f"{text} and stores {value.strip()} in it."
+    return text + "."
+
+
+def describe_increment(raw: str):
+    match = INCREMENT_RE.match(raw)
+    if not match:
+        return None
+    var = match.group("v1") or match.group("v2")
+    op = match.group("pre") or match.group("post")
+    return f"Increases {var} by 1." if op == "++" else f"Decreases {var} by 1."
+
+
+def describe_c_like_assignment(left: str, op, right: str) -> str:
+    if not op:
+        match = TYPED_LEFT_RE.match(left)
+        if match and match.group("type").split()[0] not in NOT_TYPES:
+            return (
+                f"Creates a variable named {match.group('name')} "
+                f"(type {match.group('type').strip()}) and stores {right} in it."
+            )
+    return describe_assignment(left, op, right)
+
+
+def describe_function(match, language: str, declaration_only: bool) -> str:
+    name = match.group("name")
+    params = " ".join(match.group("params").split())
+    noun = "method" if language == "java" else "function"
+    if declaration_only:
+        return f"Declares a {noun} named {name}; its code is written elsewhere."
+    if params and params != "void":
+        return f"Defines a {noun} named {name} that takes: {params}."
+    return f"Defines a {noun} named {name} that takes no inputs."
+
+
+def explain_c_like_statement(raw: str, language: str, had_semicolon: bool):
+    """Rules shared by Java and C. Returns None when nothing matches."""
+    increment = describe_increment(raw)
+    if increment:
+        return increment
+
+    decl = DECL_RE.match(raw)
+    if decl:
+        return describe_declaration(decl)
+
+    assignment = parse_assignment(raw)
+    if assignment:
+        return describe_c_like_assignment(*assignment)
+
+    func = FUNC_RE.match(raw)
+    if func and func.group("ret") not in NOT_FUNC_STARTS:
+        return describe_function(func, language, had_semicolon)
+
+    call = CALL_RE.match(raw)
+    if call:
+        return f"Calls {call.group('name')} to run some existing code."
+
+    if re.match(rf"(?:{TYPE_NAMES})\b", raw) and "(" not in raw:
+        return "Creates variables with a data type."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Per-language explainers
+# ---------------------------------------------------------------------------
+
+def explain_python_line(line: str) -> str:
+    raw = simplify_line(line)
+    if not raw:
+        return ""
+
+    if raw.startswith("print("):
+        return "Shows output on the screen."
+    if raw.startswith("if "):
+        return "Checks whether a condition is true."
+    if raw.startswith("elif "):
+        return "Checks another condition if the first one is false."
+    if raw.startswith("else:"):
+        return "Runs this code when the condition is false."
+    if raw.startswith("for "):
+        return "Repeats the code for each item in a list or loop."
+    if raw.startswith("while "):
+        return "Runs the code again while a condition stays true."
+    if raw.startswith("def "):
+        match = re.match(r"def\s+(\w+)", raw)
+        if match:
+            return f"Creates a reusable function named {match.group(1)}."
+        return "Creates a reusable function."
+    if raw == "return" or raw.startswith("return "):
+        return "Sends a value back to the caller."
+    if raw.startswith("import "):
+        return "Loads a library or extra code."
+    if raw.startswith("from ") and " import " in raw:
+        return "Loads specific items from a library or module."
+    if raw.startswith("class "):
+        match = re.match(r"class\s+(\w+)", raw)
+        if match:
+            return f"Creates a blueprint for objects named {match.group(1)}."
+        return "Creates a blueprint for objects."
+    if raw.startswith("try:"):
+        return "Starts a block of code that watches for errors."
+    if raw.startswith("except"):
+        return "Handles an error that happened in the try block."
+    if raw.startswith("finally:"):
+        return "Runs this code whether or not an error happened."
+    if raw.startswith("with "):
+        return "Opens a resource and closes it automatically when done."
+    if raw == "break":
+        return "Stops the loop early."
+    if raw == "continue":
+        return "Skips to the next round of the loop."
+    if raw == "pass":
+        return "Does nothing; it is a placeholder."
+    if raw.startswith("input("):
+        return "Reads user input from the keyboard."
+    if raw.startswith("len("):
+        return "Counts how many items are in something."
+    if ".append(" in raw:
+        return "Adds a new item to the end of a list."
+
+    assignment = parse_assignment(raw)
+    if assignment:
+        left, op, right = assignment
+        if not op:
+            if re.match(r"(?:int|float)\(\s*input\(", right):
+                return f"Reads a number typed by the user and stores it in {left}."
+            if right.startswith("input("):
+                return f"Reads text typed by the user and stores it in {left}."
+            if right.startswith("len("):
+                return f"Counts how many items there are and stores the number in {left}."
+        return describe_assignment(left, op, right)
+
+    call = CALL_RE.match(raw)
+    if call:
+        return f"Calls {call.group('name')} to run some existing code."
+    return "This line runs a specific action in the program."
+
+
+def explain_java_line(line: str) -> str:
+    raw = simplify_line(line)
+    if not raw:
+        return ""
+    had_semicolon = line.strip().endswith(";")
+
+    if re.match(r"(?:(?:public|private|protected|final|abstract|static)\s+)*class\b", raw):
+        return "Creates a Java class, which is the main container for code."
+    if re.match(r"public\s+static\s+void\s+main\b", raw):
+        return "This is the starting point of the program."
+    if raw.startswith("System.out.println("):
+        return "Prints text or values to the screen, then moves to a new line."
+    if raw.startswith("System.out.printf("):
+        return "Prints formatted text to the screen."
+    if raw.startswith("System.out.print("):
+        return "Prints text or values to the screen without starting a new line."
+    if re.match(r"else\s+if\b", raw):
+        return "Checks another condition if the earlier one was false."
+    if re.match(r"else\b", raw):
+        return "Runs this code when the earlier conditions are false."
+    if re.match(r"if\s*\(", raw):
+        return "Checks whether a condition is true."
+    if re.match(r"for\s*\(", raw):
+        return "Repeats the code a fixed number of times."
+    if re.match(r"while\s*\(", raw):
+        return "Repeats the code while a condition is true."
+    if raw == "do":
+        return "Starts a loop that always runs at least once."
+    if re.match(r"return\b", raw):
+        return "Returns a value to the caller."
+    if re.match(r"import\s", raw):
+        return "Loads a Java library or package."
+    if raw == "break":
+        return "Stops the loop or switch early."
+    if raw == "continue":
+        return "Skips to the next round of the loop."
+    if re.match(r"try\b", raw):
+        return "Starts a block of code that watches for errors."
+    if re.match(r"catch\s*\(", raw):
+        return "Handles an error that happened in the try block."
+    if re.match(r"finally\b", raw):
+        return "Runs this code whether or not an error happened."
+
+    result = explain_c_like_statement(raw, "java", had_semicolon)
+    return result or "This line performs a basic Java action."
+
+
+def explain_c_line(line: str) -> str:
+    raw = simplify_line(line)
+    if not raw:
+        return ""
+    had_semicolon = line.strip().endswith(";")
+
+    if raw.startswith("#include"):
+        return "Adds a header file with useful functions."
+    if raw.startswith("#define"):
+        return "Defines a constant or macro that is replaced before the program is compiled."
+    if re.match(r"(?:int|void)\s+main\b", raw):
+        return "This is the main function where the program starts."
+    if raw.startswith("printf("):
+        return "Prints text or values to the screen."
+    if raw.startswith("scanf("):
+        return "Reads data typed by the user."
+    if re.match(r"return\b", raw):
+        return "Ends the function and sends a value back."
+    if re.match(r"else\s+if\b", raw):
+        return "Checks another condition if the earlier one was false."
+    if re.match(r"else\b", raw):
+        return "Runs this code when the earlier conditions are false."
+    if re.match(r"if\s*\(", raw):
+        return "Checks whether a condition is true."
+    if re.match(r"for\s*\(", raw):
+        return "Repeats the code a fixed number of times."
+    if re.match(r"while\s*\(", raw):
+        return "Repeats the code while a condition is true."
+    if raw == "do":
+        return "Starts a loop that always runs at least once."
+    if raw == "break":
+        return "Stops the loop or switch early."
+    if raw == "continue":
+        return "Skips to the next round of the loop."
+
+    result = explain_c_like_statement(raw, "c", had_semicolon)
+    return result or "This line performs a basic C operation."
+
+
+# Order matters: more specific patterns (LEFT JOIN) come before general ones (JOIN).
+SQL_RULES = [
+    (r"SELECT\b", "Chooses which columns or data to show."),
+    (r"FROM\b", "Says which table to get the data from."),
+    (r"WHERE\b", "Filters rows using a condition."),
+    (r"(?:AND|OR)\b", "Adds another condition to the filter."),
+    (r"GROUP\s+BY\b", "Groups rows that have the same value."),
+    (r"HAVING\b", "Filters the groups after they have been formed."),
+    (r"ORDER\s+BY\b", "Sorts the results in a certain order."),
+    (r"LIMIT\b", "Limits how many rows are returned."),
+    (r"INNER\s+JOIN\b", "Combines two tables, keeping only rows that match in both."),
+    (r"LEFT\s+(?:OUTER\s+)?JOIN\b", "Combines two tables, keeping every row from the left table."),
+    (r"RIGHT\s+(?:OUTER\s+)?JOIN\b", "Combines two tables, keeping every row from the right table."),
+    (r"FULL\s+(?:OUTER\s+)?JOIN\b", "Combines two tables, keeping every row from both."),
+    (r"CROSS\s+JOIN\b", "Pairs every row of one table with every row of another."),
+    (r"JOIN\b", "Combines rows from two tables that match."),
+    (r"ON\b", "Says how rows from the two tables are matched."),
+    (r"INSERT\s+INTO\b", "Adds a new row of data into a table."),
+    (r"VALUES\b", "Gives the values to insert."),
+    (r"UPDATE\b", "Changes existing records in a table."),
+    (r"SET\b", "Says which columns to change and what their new values are."),
+    (r"DELETE\s+FROM\b", "Removes rows from a table."),
+    (r"CREATE\s+TABLE\b", "Creates a new table with columns."),
+    (r"ALTER\s+TABLE\b", "Changes the structure of an existing table."),
+    (r"DROP\s+TABLE\b", "Deletes a table and its data."),
+]
+SQL_RULES = [(re.compile(pattern, re.IGNORECASE), text) for pattern, text in SQL_RULES]
+
+
+def explain_sql_line(line: str) -> str:
+    raw = simplify_line(line)
+    if not raw:
+        return ""
+    for pattern, message in SQL_RULES:
+        if pattern.match(raw):
+            return message
+    return "This SQL line tells the database what to do."
+
+
+EXPLAINERS = {
+    "python": explain_python_line,
+    "java": explain_java_line,
+    "c": explain_c_line,
+    "sql": explain_sql_line,
+}
+
+
+def explain_line(line: str, language: str) -> str:
+    line = strip_inline_comment(line, language).strip()
+    if not line:
+        return ""
+    explainer = EXPLAINERS.get(language)
+    if explainer:
+        return explainer(line)
+    return "This line is part of the program."
+
+
+def explain_code_lines(snippet: str, language: str) -> list:
+    """Return a list of (code_line, explanation) pairs, one per explained line."""
+    explanations = []
+    in_block_comment = False
+
+    for raw_line in snippet.splitlines():
+        cleaned = raw_line.strip()
+
+        # Skip /* ... */ comments that span one or more lines.
+        if language in BLOCK_COMMENT_LANGUAGES:
+            if in_block_comment:
+                if "*/" in cleaned:
+                    in_block_comment = False
+                continue
+            if cleaned.startswith("/*"):
+                in_block_comment = "*/" not in cleaned
+                continue
+
+        cleaned = strip_inline_comment(cleaned, language).strip()
+        if not cleaned:  # blank line or comment-only line
+            continue
+
+        body = cleaned
+        if language in BRACE_LANGUAGES:
+            body = strip_block_braces(cleaned)
+            if not body.strip("; "):
+                explanations.append((cleaned, describe_brace_line(cleaned)))
+                continue
+
+        explanation = explain_line(body, language)
+        if explanation:
+            explanations.append((cleaned, explanation))
+
+    return explanations
+
+
+def explain_code(snippet: str, language: str) -> str:
+    if not snippet.strip():
+        return "No code was entered."
+
+    pairs = explain_code_lines(snippet, language)
+    if not pairs:
+        return "No valid lines were found to explain."
+
+    return "\n".join(f"{line}: {text}" for line, text in pairs)
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface
+# ---------------------------------------------------------------------------
+
+def read_multiline(prompt: str) -> str:
+    """Read pasted code until END_MARKER on its own line (or end of input)."""
+    print(prompt)
+    print(f"(Type {END_MARKER} on a new line when you are finished.)")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == END_MARKER:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def run_demo():
+    print("Example explanations:\n")
+    for language, snippet in EXAMPLE_SNIPPETS.items():
+        print(f"[{language.upper()}]")
+        print(explain_code(snippet, language))
+        print("-" * 50)
+
+
+def chat_with_ai():
+    """Simple chat loop using the OpenAI Responses API. Type 'quit' to go back to the menu."""
+    # The client is created here, not at import time, so the code explainer
+    # still works when the openai package or API key is missing.
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+    except ImportError:
+        print("The 'openai' package is not installed. Run: pip install openai")
+        return
+    except Exception as error:  # for example, OPENAI_API_KEY is not set
+        print(f"Could not start the AI chat: {error}")
+        print("Set the OPENAI_API_KEY environment variable and try again.")
+        return
+
+    print("\nAI Chatbot")
+    print("Type 'quit' to go back to the menu.\n")
+
+    while True:
+        try:
+            user_message = input("You: ").strip()
+        except EOFError:
+            break
+
+        if user_message.lower() == "quit":
+            break
+        if not user_message:
+            continue
+
+        try:
+            response = client.responses.create(
+                model=OPENAI_MODEL,
+                input=user_message,
+            )
+        except Exception as error:
+            print(f"AI request failed: {error}\n")
+            continue
+
+        print("AI:", response.output_text, "\n")
+
+
+def ask_language():
+    """Ask the person to pick a language. Returns None if the answer is not recognised."""
+    try:
+        answer = input(f"Language ({', '.join(SUPPORTED_LANGUAGES)}): ").strip().lower()
+    except EOFError:
+        return None
+    if answer not in SUPPORTED_LANGUAGES:
+        print("Language not recognised. Try again.")
+        return None
+    return answer
+
+
+def explain_pasted_code(language=None):
+    """Read pasted code and explain it. With no language given, it is detected."""
+    label = f"{language.upper()} code" if language else "your code"
+    code = read_multiline(f"Paste {label} here:")
+    if not code.strip():
+        print("No code entered.")
+        return
+
+    if language is None:
+        language = detect_language(code)
+        print(f"\nDetected language: {language.upper()}")
+        print("(Wrong guess? Use option 2 to choose the language yourself.)")
+
+    print("\nSimple explanation:\n")
+    print(explain_code(code, language))
+    print("\n")
+
+
+def main():
+    print("Welcome to the Code Explanation Bot!")
+
+    while True:
+        print(HELP_TEXT)
+        try:
+            choice = input("Choose an option: ").strip()
+        except EOFError:
+            print("\nGoodbye!")
+            break
+
+        if choice == "0":
+            print("Goodbye!")
+            break
+        elif choice == "1":
+            explain_pasted_code()
+        elif choice == "2":
+            language = ask_language()
+            if language:
+                explain_pasted_code(language)
+        elif choice == "3":
+            run_demo()
+        elif choice == "4":
+            chat_with_ai()
+        else:
+            print("Invalid option. Try again.")
+
+
+if __name__ == "__main__":
+    main()
